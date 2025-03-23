@@ -5,3 +5,5 @@ pandas
 torch
 tqdm
 wandb
+python-dotenv
+agno
