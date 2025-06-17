@@ -14,7 +14,7 @@ if __name__ == '__main__':
 
 
     conf = init_config()
-    data_path = "D://9_Lab//1_Recommendation_Sys//PO4ISR_demo//MA-PO4ISR//dataset//"
+    data_path = ".//MA-PO4ISR//dataset//"
     test_file = f"{data_path}cand_cross_bundle.json"
 
     with open(test_file, 'r', encoding='utf-8') as f:
