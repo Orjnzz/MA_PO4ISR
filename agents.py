@@ -2,10 +2,9 @@ import math
 import random
 import re
 import json
-from opt.request import Request
-from opt.config import init_config
-from opt.utils import extract_item_json_list, extract_wrapped_json, ndcg, extract_edit_prompt, extract_item_list
+from opt.utils import ndcg, extract_edit_prompt, extract_item_list
 from agno.agent import Agent
+from concurrent.futures import ThreadPoolExecutor
 
 class EvalAgent(Agent):
     def __init__(self,model,name='EvalAgent'):
@@ -17,50 +16,16 @@ class EvalAgent(Agent):
     def evaluate(self,prompt,session_data):
         input_str = session_data['input']
         full_prompt = f"{prompt}\n{input_str}"
-        # print("- Full prompt:\n",full_prompt)
         response = self.run(full_prompt).content
         return response
-
-#it is not neccessary to apply this agent
-# class ErrorCheckingAgent(Agent):
-#     def __init__(self,model,name='ErrorCheckingAgent'):
-#         super().__init__(
-#             model=model,
-#             description="Validates and corrects LLM responses.",
-#             name=name
-#         )
-#     def check_error(self,response,session_data):
-#         try: 
-#             data = json.loads(response)
-#             return response
-#         except json.JSONDecodeError:
-#             candidate_items = re.findall(r'\d+\."([^"]+)"', session_data['input'].split('\nCandidate Set: ')[1])
-#             correct_prompt = (
-#                 f"The following response is invalid: {response}. Please correct it to be ONLY as a JSON structure as follow: "
-#                 f'{{"1": "<item_1>", "2": "<item_2>", ... "20": "<item_20>"}} '
-#                 f"from the candidate set {candidate_items}. Wrap the corrected JSON with <START> and <END> tags."
-#             )
-#             # print("Correct prompt: ", correct_prompt)
-#             corrected_response = self.run(correct_prompt).content
-#             # print("corrected_response:", corrected_response)
-#             wrapped_json = extract_wrapped_json(corrected_response)
-#             if wrapped_json:
-#                 return wrapped_json
-#             return None
-
 
 class DetectErrrorAgent:
     def detect_error(self, response, target):
         result_list = extract_item_list(response, target)
-        # print("Detect error processing: ")
-        # print("- Response: ", response)
-        # print("- Target: ", target)
-        # print("- Result: ", result_list)
         if not result_list:
             return True
         threshold = 10
         rank = int(result_list[-1])
-        # print("- Rank: ", rank)
         return rank >= threshold
 
 class InferReasonAgent(Agent):
@@ -78,14 +43,17 @@ class InferReasonAgent(Agent):
             "give $num_feedbacks$ reasons why the prompt could have gotten this example wrong.\n"\
             "Wrap each reason with <START> and <END>"
         ).replace("$prompt$", prompt).replace("$error_case$", error_input).replace("$num_feedbacks$", str(num_feedbacks))
-        reasons = self.run(reason_prompt).content
+        for attempt in range(3): 
+            response = self.run(reason_prompt)
+            if response is not None and hasattr(response, 'content') and response.content is not None:
+                reasons = response.content
+                break
+            print(f"Attempt {attempt + 1}: Failed to get reasons, retrying...")
         extract_reasons = extract_edit_prompt(reasons)
-        # print("Len extract reasons: ",len(extract_reasons))
         if len(extract_reasons) == 0:
             reasons = reasons
         else:
             reasons = extract_reasons
-        # print("- Reasons: ", reasons)
         return reasons
 
 class RefinePromptAgent(Agent):
@@ -109,10 +77,8 @@ class RefinePromptAgent(Agent):
         extract_refined_prompts = extract_edit_prompt(refined_prompt)
         if extract_refined_prompts:
             refined_prompt = extract_refined_prompts[0]  
-            # print("- Refined prompt 1 : ", refined_prompt)
             return refined_prompt
         else:
-            # print("- Refined prompt 2 : ", refined_prompt)
             return refined_prompt
 
 class AugmentAgent(Agent):
@@ -129,53 +95,39 @@ class AugmentAgent(Agent):
             "Output:"
         ).replace("$refined_prompt$", refined_prompt)
         augmented_prompts = [self.run(augment_prompt).content for _ in range(additional_sample)]
-        # print("- augmented_prompts: ", augmented_prompts)
         return augmented_prompts
 
 class SelectionAgent(Agent):
-    def __init__(self,model,name='SelectionAgent'):
+    def __init__(self, model, name='SelectionAgent'):
         super().__init__(
             model=model,
             description='Selects the best prompts using UCB bandit algorithm.',
             name=name
         )
-        # self.eval_agent = EvalAgent(model)
-        # self.error_check_agent = ErrorCheckingAgent(model)
 
-    def select(self, prompt_list, train_data, time_steps=16, explore_param=2, sample_num=32,beam_width=5):
-        # print("- Prompt list", prompt_list)
+    def select(self, prompt_list, train_data, time_steps=16, explore_param=2, sample_num=32, beam_width=5):
         if not prompt_list:
             return []
         selections = [0] * len(prompt_list)
         rewards = [0] * len(prompt_list)
-
         for t in range(1, time_steps + 1):
             sample_data = random.sample(train_data, min(sample_num, len(train_data)))
             ucb_values = [
                 (rewards[i] / selections[i] + explore_param * math.sqrt(math.log(t) / selections[i])) if selections[i] > 0 else float('inf')
                 for i in range(len(prompt_list))
             ]
-            # print("- UCB values: ", ucb_values)
             selected_idx = ucb_values.index(max(ucb_values))
             selected_prompt = prompt_list[selected_idx]
-            # print("-select prompt: ", selected_prompt)
+            with ThreadPoolExecutor(max_workers=100) as executor:
+                predictions = list(executor.map(lambda data: self.run(f"{selected_prompt}\n{data['input']}").content, sample_data))
             reward = 0
-            for data in sample_data:
-                full_prompt = f"{selected_prompt}\n{data['input']}"
-                # print("Selection Agents: ")
-                # prediction = self.eval_agent.evaluate(selected_prompt, data)
-                prediction = self.run(full_prompt).content
-                # print("- prediction: ", prediction)
-                result_list = extract_item_list(prediction,data['target'])
-                # print("- result_list: ", result_list)
+            for prediction, data in zip(predictions, sample_data):
+                result_list = extract_item_list(prediction, data['target'])
                 if result_list:
                     target_idx = int(result_list[-1])
-                    # print("- target_idx: ", target_idx)
                     reward += ndcg(target_idx)
-                    # print(f"{t} Reward {reward}")            
             selections[selected_idx] += len(sample_data)
             rewards[selected_idx] += reward
-        
         prompt_reward_pairs = list(zip(rewards, prompt_list))
         prompt_reward_pairs.sort(reverse=True, key=lambda x: x[0])
         return [pair[1] for pair in prompt_reward_pairs[:beam_width]]
